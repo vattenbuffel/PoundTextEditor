@@ -7,3 +7,4 @@ edition = "2021"
 
 [dependencies]
 crossterm = "0.21.0"
+textwrap = "0.13.2"

@@ -1,5 +1,6 @@
 use std::io::{self, stdout, Write};
 use std::time::Duration;
+use textwrap::wrap;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::ClearType;
@@ -16,12 +17,10 @@ impl Drop for CleanUp {
 
 struct Reader;
 impl Reader {
-    fn read_key(&self) -> crossterm::Result<KeyEvent> {
+    fn read_event(&self) -> crossterm::Result<Event> {
         loop {
             if event::poll(Duration::from_millis(500))? {
-                if let Event::Key(event_) = event::read()? {
-                    return Ok(event_);
-                }
+                return Ok(event::read()?);
             }
         }
     }
@@ -36,7 +35,12 @@ struct CursorController {
 
 impl CursorController {
     fn new(win_size: (usize, usize)) -> CursorController {
-        return Self { x: 0, y: 0, x_max:win_size.0-1, y_max:win_size.1 -1};
+        return Self {
+            x: 0,
+            y: 0,
+            x_max: win_size.0 - 1,
+            y_max: win_size.1 - 1,
+        };
     }
 
     fn move_cursor(&mut self, direction: KeyCode) {
@@ -44,7 +48,7 @@ impl CursorController {
             KeyCode::Up => self.y = self.y.saturating_sub(1),
             KeyCode::Down => self.y = std::cmp::min(self.y + 1, self.y_max),
             KeyCode::Left => self.x = self.x.saturating_sub(1),
-            KeyCode::Right => self.x = std::cmp::min(self.x+1, self.x_max),
+            KeyCode::Right => self.x = std::cmp::min(self.x + 1, self.x_max),
             _ => unreachable!(),
         }
     }
@@ -67,6 +71,7 @@ impl EditorContents {
     fn push_str(&mut self, string: &str) {
         self.content.push_str(string)
     }
+
 }
 impl io::Write for EditorContents {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -116,18 +121,21 @@ impl Output {
 
         for i in 0..screen_rows {
             if i == screen_rows / 3 {
-                let mut welcome = format!("Pound editor -- Version {}", VERSION);
+                let welcome = format!("Pound editor -- Version {}", VERSION);
                 if welcome.len() > screen_colums {
-                    welcome.truncate(screen_colums);
+                    let wrapped_welcome_weird = wrap(&welcome, screen_colums);
+                    for string in wrapped_welcome_weird{
+                        self.editor_contents.push_str(&string.to_string());
+                    }
+                } else {
+                    let mut padding = (screen_colums - welcome.len()) / 2;
+                    if padding != 0 {
+                        self.editor_contents.push('~');
+                        padding -= 1;
+                    }
+                    (0..padding).for_each(|_| self.editor_contents.push(' '));
+                    self.editor_contents.push_str(&welcome);
                 }
-
-                let mut padding = (screen_colums - welcome.len()) / 2;
-                if padding != 0 {
-                    self.editor_contents.push('~');
-                    padding -= 1;
-                }
-                (0..padding).for_each(|_| self.editor_contents.push(' '));
-                self.editor_contents.push_str(&welcome);
             } else {
                 self.editor_contents.push('~');
             }
@@ -160,6 +168,16 @@ impl Output {
         )?;
         return self.editor_contents.flush();
     }
+
+    fn process_resize(&mut self, x: usize, y: usize) {
+        self.win_size = (x, y);
+        self.cursor_controller.x_max = x - 1;
+        self.cursor_controller.y_max = y - 1;
+        self.cursor_controller.x =
+            std::cmp::min(self.cursor_controller.x, self.cursor_controller.x_max);
+        self.cursor_controller.y =
+            std::cmp::min(self.cursor_controller.y, self.cursor_controller.y_max);
+    }
 }
 
 struct Editor {
@@ -175,8 +193,8 @@ impl Editor {
         };
     }
 
-    fn process_keypress(&mut self) -> crossterm::Result<bool> {
-        match self.reader.read_key()? {
+    fn process_keypress(&mut self, key_event: KeyEvent) -> crossterm::Result<bool> {
+        match key_event {
             KeyEvent {
                 code: KeyCode::Char('q'),
                 modifiers: event::KeyModifiers::CONTROL,
@@ -195,9 +213,26 @@ impl Editor {
         return Ok(true);
     }
 
+    fn process_resize(&mut self, x: usize, y: usize) {
+        self.output.process_resize(x, y);
+    }
+
+    fn process_event(&mut self) -> crossterm::Result<bool> {
+        let result = match self.reader.read_event()? {
+            Event::Resize(x, y) => {
+                self.process_resize(x as usize, y as usize);
+                true
+            }
+            Event::Key(key_event) => self.process_keypress(key_event)?,
+            _ => true,
+        };
+
+        Ok(result)
+    }
+
     fn run(&mut self) -> crossterm::Result<bool> {
         self.output.refresh_screen()?;
-        return self.process_keypress();
+        return self.process_event();
     }
 }
 
