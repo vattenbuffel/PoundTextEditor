@@ -1,5 +1,7 @@
 use std::io::{self, stdout, Write};
 use std::time::Duration;
+use std::{env, fs};
+
 use textwrap::wrap;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -31,6 +33,8 @@ struct CursorController {
     y: usize,
     x_max: usize,
     y_max: usize,
+    row_offset: usize,
+    column_offset: usize,
 }
 
 impl CursorController {
@@ -40,17 +44,68 @@ impl CursorController {
             y: 0,
             x_max: win_size.0 - 1,
             y_max: win_size.1 - 1,
+            row_offset: 0,
+            column_offset: 0,
         };
     }
 
-    fn move_cursor(&mut self, direction: KeyCode) {
+    fn move_cursor(&mut self, direction: KeyCode, number_of_rows: usize) {
         match direction {
             KeyCode::Up => self.y = self.y.saturating_sub(1),
-            KeyCode::Down => self.y = std::cmp::min(self.y + 1, self.y_max),
+            KeyCode::Down => {
+                if self.y < number_of_rows {
+                    self.y += 1;
+                }
+            }
             KeyCode::Left => self.x = self.x.saturating_sub(1),
-            KeyCode::Right => self.x = std::cmp::min(self.x + 1, self.x_max),
+            KeyCode::Right => self.x = self.x + 1,
             _ => unreachable!(),
         }
+    }
+
+    fn scroll(&mut self) {
+        self.row_offset = std::cmp::min(self.row_offset, self.y);
+        if self.y >= self.row_offset + self.y_max + 1 {
+            self.row_offset = self.y - self.y_max;
+        }
+
+        self.column_offset = std::cmp::min(self.column_offset, self.x);
+        if self.x >= self.column_offset + self.x_max + 1 {
+            self.column_offset = self.x - self.x_max;
+        }
+    }
+}
+
+struct EditorRows {
+    row_contents: Vec<Box<str>>,
+}
+
+impl EditorRows {
+    fn new() -> Self {
+        let mut arg = env::args();
+
+        match arg.nth(1) {
+            None => Self {
+                row_contents: Vec::new(),
+            },
+            Some(file) => Self::from_file(&file),
+        }
+    }
+
+    fn from_file(file: &str) -> Self {
+        let file_contents = fs::read_to_string(file).expect("unable to read file");
+
+        return Self {
+            row_contents: file_contents.lines().map(|it| it.into()).collect(),
+        };
+    }
+
+    fn number_of_rows(&self) -> usize {
+        return self.row_contents.len();
+    }
+
+    fn get_row(&self, at: usize) -> &str {
+        return &self.row_contents[at];
     }
 }
 
@@ -71,7 +126,6 @@ impl EditorContents {
     fn push_str(&mut self, string: &str) {
         self.content.push_str(string)
     }
-
 }
 impl io::Write for EditorContents {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -96,6 +150,7 @@ struct Output {
     win_size: (usize, usize),
     editor_contents: EditorContents,
     cursor_controller: CursorController,
+    editor_rows: EditorRows,
 }
 impl Output {
     fn new() -> Self {
@@ -107,6 +162,7 @@ impl Output {
             win_size,
             editor_contents: EditorContents::new(),
             cursor_controller: CursorController::new(win_size),
+            editor_rows: EditorRows::new(),
         };
     }
 
@@ -120,24 +176,36 @@ impl Output {
         let screen_rows = self.win_size.1;
 
         for i in 0..screen_rows {
-            if i == screen_rows / 3 {
-                let welcome = format!("Pound editor -- Version {}", VERSION);
-                if welcome.len() > screen_colums {
-                    let wrapped_welcome_weird = wrap(&welcome, screen_colums);
-                    for string in wrapped_welcome_weird{
-                        self.editor_contents.push_str(&string.to_string());
+            let file_row = i + self.cursor_controller.row_offset;
+            if file_row >= self.editor_rows.number_of_rows() {
+                if self.editor_rows.number_of_rows() == 0 && i == screen_rows / 3 {
+                    let welcome = format!("Pound editor -- Version {}", VERSION);
+                    if welcome.len() > screen_colums {
+                        let wrapped_welcome_weird = wrap(&welcome, screen_colums);
+                        for string in wrapped_welcome_weird {
+                            self.editor_contents.push_str(&string.to_string());
+                        }
+                    } else {
+                        let mut padding = (screen_colums - welcome.len()) / 2;
+                        if padding != 0 {
+                            self.editor_contents.push('~');
+                            padding -= 1;
+                        }
+                        (0..padding).for_each(|_| self.editor_contents.push(' '));
+                        self.editor_contents.push_str(&welcome);
                     }
                 } else {
-                    let mut padding = (screen_colums - welcome.len()) / 2;
-                    if padding != 0 {
-                        self.editor_contents.push('~');
-                        padding -= 1;
-                    }
-                    (0..padding).for_each(|_| self.editor_contents.push(' '));
-                    self.editor_contents.push_str(&welcome);
+                    self.editor_contents.push('~');
                 }
             } else {
-                self.editor_contents.push('~');
+                let row = self
+                    .editor_rows
+                    .get_row(i + self.cursor_controller.row_offset);
+                let column_offset = self.cursor_controller.column_offset;
+
+                let len = std::cmp::min(row.len().saturating_sub(column_offset), screen_colums);
+                let start = if len == 0 { 0 } else { column_offset };
+                self.editor_contents.push_str(&row[start..start + len]);
             }
 
             queue!(
@@ -152,18 +220,19 @@ impl Output {
     }
 
     fn move_cursor(&mut self, direction: KeyCode) {
-        self.cursor_controller.move_cursor(direction);
+        self.cursor_controller
+            .move_cursor(direction, self.editor_rows.number_of_rows());
     }
 
     fn refresh_screen(&mut self) -> crossterm::Result<()> {
+        self.cursor_controller.scroll();
         queue!(self.editor_contents, cursor::Hide, cursor::MoveTo(0, 0))?;
-        Self::clear_screen()?;
         self.draw_rows();
-        let cursor_x = self.cursor_controller.x as u16;
-        let cursor_y = self.cursor_controller.y as u16;
+        let cursor_x = self.cursor_controller.x - self.cursor_controller.column_offset;
+        let cursor_y = self.cursor_controller.y - self.cursor_controller.row_offset;
         queue!(
             self.editor_contents,
-            cursor::MoveTo(cursor_x, cursor_y),
+            cursor::MoveTo(cursor_x as u16, cursor_y as u16),
             cursor::Show
         )?;
         return self.editor_contents.flush();
